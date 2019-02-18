@@ -1,8 +1,9 @@
-
 //   ZigBee 4 Speed Ceiling Fan Thermostat Control
    
-  def version() {return "v0.1b.20170609" }    
+  def version() {return "v0.1b.20180715" }    
 /*  Change Log
+ 2018-07-15 adding a parameter for a thermostat setpoint input and made high setting go to med-hi instead. using ecobee thermostat set point as room setpoint
+ 2018-07-05 adding a parameter for an 'override' switch, which i will use to programmatically switch to manual control when wall switch is pressed
  2017-06-09 removed the delay line for LOW speed start until ST platform issues are resolved
  2017-06-01 removed singleInstance since we don't use a Service Manager, move Version Info, User Guide to Parent screen
  2017-05-04 fixed user manual title to 4Speed, icons moved to KOF repo, user manual content revised
@@ -63,15 +64,21 @@ def childStartPage() {
         section("Select a room temperature sensor to control the fan..."){
 			input "tempSensor", "capability.temperatureMeasurement", multiple:false, title: "Temperature Sensor", required: true, submitOnChange: true  
 		}
-        if (tempSensor) {  //protects from a null error
-    		section("Enter the desired room temperature setpoint...\n" + "NOTE: ${tempSensor.displayName} room temp is ${tempSensor.currentTemperature}° currently"){
-        		input "setpoint", "decimal", title: "Room Setpoint Temp", defaultValue: tempSensor.currentTemperature, required: true
-    		}
-        }
-        else 
-        	section("Enter the desired room temperature setpoint..."){
-        		input "setpoint", "decimal", title: "Room Setpoint Temp", required: true
-    		}       
+        section("Select a thermostat setpoint to for desired room temp setpoint (optional, if none, use manual setting)..."){
+			input "thermoSetpoint", "capability.thermostat", multiple:false, title: "Thermostat", required: false, submitOnChange: true  
+		}
+        if (!thermoSetpoint) {
+            if (tempSensor) {  //protects from a null error
+                section("Enter the desired room temperature setpoint...\n" + "NOTE: ${tempSensor.displayName} room temp is ${tempSensor.currentTemperature}° currently"){
+                    input "setpoint", "decimal", title: "Room Setpoint Temp", defaultValue: tempSensor.currentTemperature, required: true
+                }
+            }
+            else 
+                section("Enter the desired room temperature setpoint..."){
+                    input "setpoint", "decimal", title: "Room Setpoint Temp", required: true
+                }       
+        
+		}
         section("Select the Parent ceiling fan/light control hardware... (NOT the Light or Fan Speed Child )"){
         // fanDimmer
 			input "fanSwitch", "capability.switch", multiple:false, title: "ZigBee Fan Control device", required: true
@@ -119,6 +126,10 @@ def optionsPage() {
         section("Select ceiling fan operating mode desired (default to 'YES-Auto'..."){
 			input "autoMode", "enum", title: "Enable Ceiling Fan Thermostat?", options: ["NO-Manual","YES-Auto"], required: false
 		}
+        section("Select switch to override auto fan control (optional, leave blank to not utilize and override switch)") {
+			input "autoOverride", "capability.switch", title: "Auto mode override switch", required: false, submitOnChange: true
+		}
+        
     	section ("Change SmartApp name, Mode selector") {
 		mode title: "Set for specific mode(s)", required: false
 		}
@@ -165,6 +176,12 @@ def initChild() {
 	if (motionSensor) {
 		subscribe(motionSensor, "motion", motionHandler) //call the motionHandler method when there is any reported change to the "motion" attribute
 	}   
+    if (autoOverride) {
+    	subscribe(autoOverride, "switch.off", switchHandler) // call the switchHandler method when there is any reported change to the "switch" attribute
+    }
+    if (thermoSetpoint) {
+    	subscribe(thermoSetpoint, "thermostat.thermostatSetpoint", thermostatHandler) // call the thermostatHandler method when there is any reported change to the thermostat setpoint attribute
+    }
 }
 
 def initParent() {
@@ -177,12 +194,31 @@ def temperatureHandler(evt) {
 	log.debug "temperatureHandler evt.doubleValue : $evt"
 }
 
+def thermostatHandler(evt) {
+	log.debug "thermostatHandler called: $evt"	
+    
+	def lastTemp = tempSensor.currentTemperature
+	if (lastTemp != null) {
+        tempCheck(lastTemp,evt.doubleValue)
+	}
+	log.debug "thermostatHandler evt.doubleValue : $evt"
+}
+
 def handleTemperature(temp) {		//
-	log.debug "handleTemperature called: $evt"	
+	log.debug "handleTemperature called, temp: $temp setpoint: $thermoSetpoint.currentThermostatSetpoint"	
 	def isActive = hasBeenRecentMotion()
 	if (isActive) {
 		//motion detected recently
-		tempCheck(temp, setpoint)
+        if(thermoSetpoint){
+            def lastSetpoint = thermoSetpoint.currentThermostatSetpoint
+            log.debug "lastSetpoint: $lastSetpoint"
+            if(lastSetpoint != null){
+                tempCheck(temp,lastSetpoint)
+            }
+        }
+        else {
+			tempCheck(temp, setpoint)
+        }
 		log.debug "handleTemperature ISACTIVE($isActive)"
 	}
 	else {
@@ -196,7 +232,16 @@ def motionHandler(evt) {
 		def lastTemp = tempSensor.currentTemperature
 		log.debug "motionHandler ACTIVE($isActive)"
 		if (lastTemp != null) {
-			tempCheck(lastTemp, setpoint)
+        	if (thermoSetpoint) {
+				def lastSetpoint = thermoSetpoint.currentThermostatSetpoint
+                log.debug "lastSetpoint: $lastSetpoint"
+                if(lastSetpoint != null){
+                    tempCheck(lastTemp,lastSetpoint)
+                }
+            }
+        	else {
+				tempCheck(lastTemp, setpoint)
+        	}
 		}
 	} else if (evt.value == "inactive") {		//testing to see if evt.value is indeed equal to "inactive" (vs evt.value to "active")
 		//motion stopped
@@ -204,43 +249,64 @@ def motionHandler(evt) {
 		log.debug "motionHandler INACTIVE($isActive)"
 		if (isActive) {
 			def lastTemp = tempSensor.currentTemperature
-			if (lastTemp != null) {				//lastTemp not equal to null (value never been set) 
-				tempCheck(lastTemp, setpoint)
-			}
+            if (lastTemp != null) {
+				def lastSetpoint = thermoSetpoint.currentThermostatSetpoint
+                log.debug "lastSetpoint: $lastSetpoint"
+                if(lastSetpoint != null){
+                    tempCheck(lastTemp,lastSetpoint)
+                }
+                else {
+                    tempCheck(lastTemp, setpoint)
+                }
+            }
 		}
 		else {
      	    fanSwitch.off()
 		}
 	}
 }
+def switchHandler(evt) {
+		//leaving override mode -> return to auto mode
+		def lastTemp = tempSensor.currentTemperature
+		log.debug "override turned off, returning to auto mode"
+		if (lastTemp != null) {
+			if(thermoSetpoint){
+        		tempCheck(lastTemp,thermoSetpoint.currentThermostatSetpoint)
+        	}
+        	else {
+				tempCheck(lastTemp, setpoint)
+        	}
+        }
+ }
 
 private tempCheck(currentTemp, desiredTemp)
 {
-	log.debug "TEMPCHECK#1(CT=$currentTemp,SP=$desiredTemp,FS=$fanSwitch.currentSwitch,automode=$autoMode,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue)"
+	log.debug "TEMPCHECK#1(CT=$currentTemp,SP=$desiredTemp,FS=$fanSwitch.currentSwitch,automode=$autoMode,override=$autoOverride,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue)"
     
     //convert Fan Diff Temp input enum string to number value and if user doesn't select a Fan Diff Temp default to 1.0 
     def fanDiffTempValue = (settings.fanDiffTempString != null && settings.fanDiffTempString != "") ? Double.parseDouble(settings.fanDiffTempString): 1.0
 	
     //if user doesn't select autoMode then default to "YES-Auto"
     def autoModeValue = (settings.autoMode != null && settings.autoMode != "") ? settings.autoMode : "YES-Auto"	
+    def autoOverrideValue = (autoOverride != null && settings.autoOverride != "") ? autoOverride.currentSwitch : "off"
     
     def LowDiff = fanDiffTempValue*1 
     def MedDiff = fanDiffTempValue*2
     def MedHighDiff = fanDiffTempValue*3
     def HighDiff = fanDiffTempValue*4
 	
-	log.debug "TEMPCHECK#2(CT=$currentTemp,SP=$desiredTemp,FS=$fanSwitch.currentSwitch, automode=$autoMode,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue)"
-	if (autoModeValue == "YES-Auto") {
+	log.debug "TEMPCHECK#2(CT=$currentTemp,SP=$desiredTemp,FS=$fanSwitch.currentSwitch, automode=$autoMode,FDTstring=$fanDiffTempString, FDTvalue=$fanDiffTempValue,autoOverrideValue=$autoOverrideValue)"
+	if (autoModeValue == "YES-Auto" && autoOverrideValue == "off") {
     	switch (currentTemp - desiredTemp) {
         case { it  >= HighDiff }:
-        		// turn on fan HIGH speed4
-       			fanSwitch.setFanSpeed(4) 
-            	log.debug "HI speed(CT=$currentTemp, SP=$desiredTemp, FS=$fanSwitch.currentSwitch, Speed=$currentsetFanSpeed, HighDiff=$HighDiff)"
+        		// turn on fan HIGH speed4 djg modifying it because my fan gets scary wobbly at high speed!
+       			fanSwitch.setFanSpeed(3) 
+            	log.debug "MED-HI speed(CT=$currentTemp, SP=$desiredTemp, FS=$fanSwitch.currentSwitch, Speed=$currentsetFanSpeed, HighDiff=$HighDiff)"
 	        break 
         case { it  >= MedHighDiff }:
         		// turn on fan MED-HIGH speed3
        			fanSwitch.setFanSpeed(3) 
-            	log.debug "HI speed(CT=$currentTemp, SP=$desiredTemp, FS=$fanSwitch.currentSwitch, Speed=$currentsetFanSpeed, HighDiff=$HighDiff)"
+            	log.debug "MED-HI speed(CT=$currentTemp, SP=$desiredTemp, FS=$fanSwitch.currentSwitch, Speed=$currentsetFanSpeed, HighDiff=$HighDiff)"
 	        break 
 		case { it >= MedDiff }:
             	// turn on fan MEDIUM speed2
